@@ -23,24 +23,71 @@ jobs:
         with:
           persist-credentials: false
 
-      # Required workflows run in the context of the target repository, so a
-      # config file committed here is not checked out. Write it to RUNNER_TEMP.
-      # Third-party actions must be at least 7 days old; first-party labd/*
-      # actions are exempt so our own fresh releases can be adopted right away.
-      # Note: do not set the `min_age` input, the --min-age flag overrides rules.
+      # Build the pinact config for the org-wide check. Required workflows run
+      # in the context of the target repository, so it is written to
+      # RUNNER_TEMP rather than committed here.
+      #
+      # Policy: every action must be at least ORG_MIN_AGE days old, except
+      # first-party labd/* actions. A repository's own pinact config is merged
+      # in (files, ignore_actions, separator, ghes, rules are kept), but it can
+      # only raise the minimum age, never lower it: repo rules that lower
+      # min_age below the org minimum have that override removed.
+      #
+      # Do not set the action's `min_age` input: --min-age overrides all rules.
       - name: Write pinact config
+        id: pinact-config
         if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          ORG_MIN_AGE: "7"
         run: |
-          cat > "$RUNNER_TEMP/pinact.yaml" <<'EOF'
-          version: 3
-          min_age:
-            value: 7
-            always: true
-          rules:
-            - min_age: 0
-              conditions:
-                - expr: ActionRepoOwner == "labd"
-          EOF
+          set -euo pipefail
+          out="$RUNNER_TEMP/pinact.yaml"
+
+          # Same discovery order as pinact (pkg/config findProjectConfigPath).
+          repo_cfg=""
+          for p in .pinact.yaml .github/pinact.yaml .pinact.yml .github/pinact.yml; do
+            if [ -f "$p" ]; then
+              repo_cfg="$p"
+              break
+            fi
+          done
+
+          if [ -z "$repo_cfg" ]; then
+            echo "No repository pinact config found, using the org default"
+            printf '%s\n' 'version: 3' > "$out"
+          elif [ "$(yq '.version // 0' "$repo_cfg")" != "3" ]; then
+            # Unknown schema version: we can't merge safely. Use the repo
+            # config as-is and enforce the org minimum for every action
+            # (including labd/*) via PINACT_MIN_AGE.
+            echo "::warning file=$repo_cfg::pinact config schema version is not 3; org min-age policy is applied to all actions without the labd exemption"
+            echo "PINACT_MIN_AGE=$ORG_MIN_AGE" >> "$GITHUB_ENV"
+            echo "path=$repo_cfg" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            echo "Merging repository pinact config $repo_cfg with the org policy"
+            # `files` patterns are relative to the config file's directory.
+            CFG_DIR=$(python3 -c 'import os, sys; print(os.path.relpath(os.path.dirname(os.path.abspath(sys.argv[1])), sys.argv[2]))' "$repo_cfg" "$RUNNER_TEMP")
+            export CFG_DIR
+            lowered=$(yq '[.rules[]? | select(has("min_age") and .min_age < env(ORG_MIN_AGE))] | length' "$repo_cfg")
+            if [ "$lowered" != "0" ]; then
+              echo "::warning file=$repo_cfg::$lowered rule(s) lower min_age below the org minimum of $ORG_MIN_AGE days; these overrides are ignored by the org check (labd/* actions are always exempt)"
+            fi
+            yq '
+              (select(has("files")) | .files[].pattern) |= strenv(CFG_DIR) + "/" + . |
+              (.rules[]? | select(has("min_age") and .min_age < env(ORG_MIN_AGE))) |= del(.min_age) |
+              .rules = [(.rules // [])[] | select(has("min_age") or has("ignore"))]
+            ' "$repo_cfg" > "$out"
+          fi
+
+          yq -i '
+            .min_age.value = ([(.min_age.value // 0), env(ORG_MIN_AGE)] | max) |
+            .min_age.always = true |
+            .rules = (.rules // []) + [{"min_age": 0, "conditions": [{"expr": "ActionRepoOwner == \"labd\""}]}]
+          ' "$out"
+
+          echo "Effective pinact config:"
+          cat "$out"
+          echo "path=$out" >> "$GITHUB_OUTPUT"
 
       - name: Pin actions
         if: github.event.pull_request.head.repo.full_name == github.repository
@@ -48,7 +95,8 @@ jobs:
         with:
           skip_push: true
           verify: true
-          config: ${{ runner.temp }}/pinact.yaml
+          verify_min_age: true
+          config: ${{ steps.pinact-config.outputs.path }}
 
       - name: Run zizmor
         uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
