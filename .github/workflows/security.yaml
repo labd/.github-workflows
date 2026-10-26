@@ -93,7 +93,7 @@ jobs:
         if: github.event.pull_request.head.repo.full_name == github.repository
         uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
         with:
-          skip_push: true
+          skip_push: true fix: false
           verify: true
           verify_min_age: true
           config: ${{ steps.pinact-config.outputs.path }}
